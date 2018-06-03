@@ -1,6 +1,7 @@
 
 /*
  * Copyright (c) 2018 WangBin <wbsecg1 at gmail.com>
+ * Original code is from QtAV project
  */
 #include "mdk/VideoDecoder.h"
 #include "mdk/MediaInfo.h"
@@ -11,81 +12,6 @@ extern "C" {
 #include <libcedarv/libcedarv.h>
 }
 MDK_NS_BEGIN
-
-// source data is colum major. every block is 32x32
-static void map32x32_to_yuv_Y(void* srcY, void* tarY, unsigned int dst_pitch, unsigned int coded_width, unsigned int coded_height)
-{
-    unsigned long offset;
-    unsigned char *ptr = (unsigned char *)srcY;
-    const unsigned int mb_width = (coded_width+15) >> 4;
-    const unsigned int mb_height = (coded_height+15) >> 4;
-    const unsigned int twomb_line = (mb_height+1) >> 1;
-    const unsigned int recon_width = (mb_width+1) & 0xfffffffe;
-
-    for (unsigned int i = 0; i < twomb_line; i++) {
-        const unsigned int M = 32*i;
-        for (unsigned int j = 0; j < recon_width; j+=2) {
-            const unsigned int n = j*16;
-            offset = M*dst_pitch + n;
-            for (unsigned int l = 0; l < 32; l++) {
-                if (M+l < coded_height) {
-                    if (n+16 < coded_width) {
-                        //1st & 2nd mb
-                        memcpy((unsigned char *)tarY+offset, ptr, 32);
-                    } else if (n<coded_width) {
-                        // 1st mb
-                        memcpy((unsigned char *)tarY+offset, ptr, 16);
-                    }
-                    offset += dst_pitch;
-                }
-                ptr += 32;
-            }
-        }
-    }
-}
-
-static void map32x32_to_yuv_C(void* srcC, void* tarCb, void* tarCr, unsigned int dst_pitch, unsigned int coded_width, unsigned int coded_height)
-{
-    coded_width /= 2; // libvdpau-sunxi compatible
-    unsigned char line[32];
-    unsigned long offset;
-    unsigned char *ptr = (unsigned char *)srcC;
-    const unsigned int mb_width = (coded_width+7) >> 3;
-    const unsigned int mb_height = (coded_height+7) >> 3;
-    const unsigned int fourmb_line = (mb_height+3) >> 2;
-    const unsigned int recon_width = (mb_width+1) & 0xfffffffe;
-
-    for (unsigned int i = 0; i < fourmb_line; i++) {
-        const int M = i*32;
-        for (unsigned int j = 0; j < recon_width; j+=2) {
-            const unsigned int n = j*8;
-            offset = M*dst_pitch + n;
-            for (unsigned int l = 0; l < 32; l++) {
-                if (M+l < coded_height) {
-                    if (n+8 < coded_width) {
-                        // 1st & 2nd mb
-                        memcpy(line, ptr, 32);
-                        //unsigned char *line = ptr;
-                        for (int k = 0; k < 16; k++) {
-                            *((unsigned char *)tarCb + offset + k) = line[2*k];
-                            *((unsigned char *)tarCr + offset + k) = line[2*k+1];
-                        }
-                    } else if (n < coded_width) {
-                        // 1st mb
-                        memcpy(line, ptr, 16);
-                        //unsigned char *line = ptr;
-                        for (int k = 0; k < 8; k++) {
-                            *((unsigned char *)tarCb + offset + k) = line[2*k];
-                            *((unsigned char *)tarCr + offset + k) = line[2*k+1];
-                        }
-                    }
-                    offset += dst_pitch;
-                }
-                ptr += 32;
-            }
-        }
-    }
-}
 
 class CedarXVideoDecoder final : public VideoDecoder
 {
@@ -98,10 +24,7 @@ public:
     bool decode(const Packet& pkt) override;
 private:
     CEDARV_DECODER *dec_ = nullptr;
-    typedef void (*map_y_t)(void* src, void* dst, unsigned int dst_pitch, unsigned int w, unsigned int h);
-    map_y_t map_y_ = map32x32_to_yuv_Y;
-    typedef void (*map_c_t)(void* src, void* dst1, void* dst2, unsigned int dst_pitch, unsigned int w, unsigned int h);
-    map_c_t map_c_ = map32x32_to_yuv_C;
+    NativeVideoBufferPoolRef pool_ = NativeVideoBufferPool::create("CedarV");
 };
 
 #define CEDARX_ENSURE(f, ...) CEDARX_CHECK(f, return __VA_ARGS__;)
@@ -219,47 +142,21 @@ bool CedarXVideoDecoder::decode(const Packet& pkt)
     info.flags = CEDARV_FLAG_FIRST_PART | CEDARV_FLAG_LAST_PART | CEDARV_FLAG_PTS_VALID;
     CEDARX_ENSURE(dec_->update_data(dec_, &info), false);
     CEDARX_ENSURE(dec_->decode(dec_), false);
-    cedarv_picture_t pic{};
-    auto ret = dec_->display_request(dec_, &pic);
+    cedarv_picture_t *pic = new cedarv_picture_t();
+    auto ret = dec_->display_request(dec_, pic);
     if (ret > 3 || ret < 0) {
-       std::clog << "CedarV: display_request failed: " <<  ret << std::endl;
-       if (pic.id) {
-           dec_->display_release(dec_, pic.id);
-           pic.id = 0;
-       }
-       return false;
+        std::clog << "CedarV: display_request failed: " <<  ret << ", picture id: " << pic->id << std::endl;
+        delete pic;
+        return false;
     }
-
-#define FFALIGN(x, a) (((x)+(a)-1)&~((a)-1))
-    pic.display_height = FFALIGN(pic.display_height, 8);
-    const int display_h_align = FFALIGN(pic.display_height, 2); // already aligned to 8!
-    const int display_w_align = FFALIGN(pic.display_width, 16);
-    const int dst_y_stride = display_w_align;
-    const int dst_c_stride = FFALIGN(pic.display_width/2, 16);
-
-    const uint8_t *plane[2]{};
-    int pitch[] = {
-        dst_y_stride,
-        dst_y_stride, // uv plane
-    };
-    VideoFrame frame(display_w_align, display_h_align, PixelFormat::NV12, pitch, plane);
-    frame.setTimestamp(double(pic.pts)/1000.0);
-    if (map_y_) {
-        map_y_(pic.y, (void*)plane[0], display_w_align, pitch[0], display_h_align);
-        map_y_(pic.u, (void*)plane[1], pitch[1], display_w_align, display_h_align/2);
-    } else {
-        memcpy((void*)plane[0], pic.y, pitch[0]*display_h_align);
-        memcpy((void*)plane[1], pic.u, pitch[1]*display_h_align/2);
-    }
+    //std::clog << "cedarv_picture_t.id: " << pic->id<< std::endl;
+    auto buf = pool_->getBuffer(pic, [pic, this]{ // TODO: shared_ptr<dec_>
+        dec_->display_release(dec_, pic->id);
+        delete pic;
+    });
+    VideoFrame frame(pic->display_width, pic->display_height, PixelFormat::NV12, buf); // TODO: can be mapped as yuv420p, rgb24
+    frame.setTimestamp(double(pic->pts)/1000.0);
     frameDecoded(frame);
-    dec_->display_release(dec_, pic.id);
-
-    /*
-    const EGLint renderImageAttrs[] = { 
-      EGL_IMAGE_PRESERVED_KHR, EGL_FALSE, 
-      EGL_NONE
-    };
-    */
     return true;
 }
 
