@@ -3,52 +3,30 @@
  */
 #include "mdk/VideoBuffer.h"
 #include "mdk/VideoFrame.h"
-//#include "NativeVideoBufferTemplate.h"
+#include "NativeVideoBufferTemplate.h"
 #include <iostream>
+#include <memory>
 #include <mutex>
 extern "C" {
 #include <libcedarv/libcedarv.h>
 }
 using namespace std;
+#define FFALIGN(x, a) (((x)+(a)-1)&~((a)-1))
 
 MDK_NS_BEGIN
 class CedarVBufferPool final : public NativeVideoBufferPool {
 public:
     NativeVideoBufferRef getBuffer(void* opaque, std::function<void()> cleanup = nullptr) override;
     bool transfer_to_host(cedarv_picture_t* buf, NativeVideoBuffer::MemoryArray* ma, NativeVideoBuffer::MapParameter *mp);
+    bool transfer_begin(cedarv_picture_t* buf, NativeVideoBuffer::GLTextureArray* ma, NativeVideoBuffer::MapParameter *mp) {return false;}
+    void transfer_end() {}
 private:
     std::mutex hos_mutex_;
     VideoFrame host_;
 };
 
 typedef shared_ptr<CedarVBufferPool> PoolRef;
-//using CedarVBuffer = NativeVideoBufferImpl<cedarv_picture_t*, CedarVBufferPool>;
-class CedarVBuffer final : public NativeVideoBuffer {
-    cedarv_picture_t* buf_ = nullptr;
-    GLTextureArray ta_;
-    MemoryArray ma_;
-    PoolRef pool_;
-    std::function<void()> cleanup_ = nullptr;
-public:
-    CedarVBuffer(PoolRef p, cedarv_picture_t* buf, std::function<void()> cleanup) : pool_(p), buf_(buf), cleanup_(cleanup) {}
-    ~CedarVBuffer() {
-        if (cleanup_)
-            cleanup_();
-    }
-    void* map(Type type, NativeVideoBuffer::MapParameter *mp) override {
-        if (type == NativeVideoBuffer::GLTexture) {
-            return nullptr;
-        }
-        if (type == NativeVideoBuffer::HostMemory) {
-            if (pool_->transfer_to_host(buf_, &ma_, mp))
-                return &ma_;
-        }
-        if (type == NativeVideoBuffer::Original) {
-            return buf_;
-        }
-        return nullptr;
-    }
-};
+using CedarVBuffer = NativeVideoBufferImpl<cedarv_picture_t*, CedarVBufferPool>;
 
 NativeVideoBufferRef CedarVBufferPool::getBuffer(void* opaque, std::function<void()> cleanup)
 {
@@ -137,7 +115,7 @@ map_c_t map_c_ = map32x32_to_yuv_C;
 
 bool CedarVBufferPool::transfer_to_host(cedarv_picture_t* buf, NativeVideoBuffer::MemoryArray* ma, NativeVideoBuffer::MapParameter *mp)
 {
-#define FFALIGN(x, a) (((x)+(a)-1)&~((a)-1))
+    // TODO: upload as texture directly and convert tile in shader
     buf->display_height = FFALIGN(buf->display_height, 8);
     const int display_h_align = FFALIGN(buf->display_height, 2); // already aligned to 8!
     const int display_w_align = FFALIGN(buf->display_width, 16);
