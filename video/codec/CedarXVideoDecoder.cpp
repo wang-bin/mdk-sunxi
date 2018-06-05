@@ -16,7 +16,9 @@ MDK_NS_BEGIN
 class CedarXVideoDecoder final : public VideoDecoder
 {
 public:
-    ~CedarXVideoDecoder() override;
+    ~CedarXVideoDecoder() override {
+        //libcedarv_exit(dec_);
+    }
     const char* name() const override {return "CedarX";}
     bool open() override;
     bool close() override;
@@ -36,11 +38,6 @@ private:
             __VA_ARGS__ \
         } \
     } while (false)
-
-CedarXVideoDecoder::~CedarXVideoDecoder()
-{
-    //libcedarv_exit(dec_);
-}
 
 static const struct {
     const char* name;
@@ -119,13 +116,14 @@ bool CedarXVideoDecoder::close()
     if (!dec_)
         return true;
     dec_->ioctrl(dec_, CEDARV_COMMAND_STOP, 0);
-    // FIXME: why crash?
-    //dec_->close(dec_);
+    //dec_->close(dec_); // FIXME: still used in native video buffer
     return true;
 }
 
 bool CedarXVideoDecoder::decode(const Packet& pkt)
 {
+    if (pkt.isEnd())
+        return false;
     if (pkt.buffer->size() <= 0) // TODO: EOS
         return true;
     //dec_->ioctrl(dec_, CEDARV_COMMAND_JUMP, 0);
@@ -157,7 +155,7 @@ bool CedarXVideoDecoder::decode(const Packet& pkt)
     VideoFrame frame(pic->display_width, pic->display_height, PixelFormat::NV12, buf); // TODO: can be mapped as yuv420p, rgb24
     frame.setTimestamp(double(pic->pts)/1000.0);
     frameDecoded(frame);
-    return true;
+    return !pkt.isEnd();
 }
 
 void register_video_decoders_cedarx() {
