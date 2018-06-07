@@ -12,21 +12,18 @@ extern "C" {
 #include <libcedarv/libcedarv.h>
 }
 MDK_NS_BEGIN
-
+using namespace std;
 class CedarXVideoDecoder final : public VideoDecoder
 {
 public:
-    ~CedarXVideoDecoder() override {
-        //libcedarv_exit(dec_);
-    }
     const char* name() const override {return "CedarX";}
     bool open() override;
     bool close() override;
     bool flush() override {return true;}
     bool decode(const Packet& pkt) override;
 private:
-    CEDARV_DECODER *dec_ = nullptr;
-    NativeVideoBufferPoolRef pool_ = NativeVideoBufferPool::create("CedarV");
+    shared_ptr<CEDARV_DECODER> dec_;
+    NativeVideoBufferPoolRef pool_ = NativeVideoBufferPool::create("CedarV"); // GLVA.CedarV
 };
 
 #define CEDARX_ENSURE(f, ...) CEDARX_CHECK(f, return __VA_ARGS__;)
@@ -89,10 +86,14 @@ bool CedarXVideoDecoder::open()
         return false;
     }
     if (!dec_) {
-        int ret;
-        dec_ = libcedarv_init(&ret);
-        if (ret < 0 || !dec_)
+        int ret = 0;
+        auto dec = libcedarv_init(&ret);
+        if (ret < 0 || !dec)
             return false;
+        dec_.reset(dec, [](CEDARV_DECODER* dec){
+            dec->close(dec); // does not affect picture release?
+            libcedarv_exit(dec);
+        });
     }
 
     cedarv_stream_info_t info{};
@@ -104,10 +105,10 @@ bool CedarXVideoDecoder::open()
         info.init_data = (u8*)par.extra.data();
         info.init_data_len = par.extra.size();
     }
-    CEDARX_ENSURE(dec_->set_vstream_info(dec_, &info), false);
-    CEDARX_ENSURE(dec_->open(dec_), false);
-    dec_->ioctrl(dec_, CEDARV_COMMAND_RESET, 0);
-    dec_->ioctrl(dec_, CEDARV_COMMAND_PLAY, 0);
+    CEDARX_ENSURE(dec_->set_vstream_info(dec_.get(), &info), false);
+    CEDARX_ENSURE(dec_->open(dec_.get()), false);
+    dec_->ioctrl(dec_.get(), CEDARV_COMMAND_RESET, 0);
+    dec_->ioctrl(dec_.get(), CEDARV_COMMAND_PLAY, 0);
     return true;
 }
 
@@ -115,8 +116,8 @@ bool CedarXVideoDecoder::close()
 {
     if (!dec_)
         return true;
-    dec_->ioctrl(dec_, CEDARV_COMMAND_STOP, 0);
-    //dec_->close(dec_); // FIXME: still used in native video buffer
+    dec_->ioctrl(dec_.get(), CEDARV_COMMAND_STOP, 0);
+    dec_.reset();
     return true;
 }
 
@@ -126,10 +127,10 @@ bool CedarXVideoDecoder::decode(const Packet& pkt)
         return false;
     if (pkt.buffer->size() <= 0) // TODO: EOS
         return true;
-    //dec_->ioctrl(dec_, CEDARV_COMMAND_JUMP, 0);
+    //dec_->ioctrl(dec_.get(), CEDARV_COMMAND_JUMP, 0);
     u32 bufsize0, bufsize1;
     u8 *buf0, *buf1;
-    CEDARX_ENSURE(dec_->request_write(dec_, pkt.buffer->size(), &buf0, &bufsize0, &buf1, &bufsize1), false);
+    CEDARX_ENSURE(dec_->request_write(dec_.get(), pkt.buffer->size(), &buf0, &bufsize0, &buf1, &bufsize1), false);
     memcpy(buf0, pkt.buffer->constData(), bufsize0);
     if ((u32)pkt.buffer->size() > bufsize0)
         memcpy(buf1, pkt.buffer->constData() + bufsize0, bufsize1);
@@ -138,10 +139,10 @@ bool CedarXVideoDecoder::decode(const Packet& pkt)
     info.lengh = pkt.buffer->size();
     info.pts = pkt.pts * 1000.0;
     info.flags = CEDARV_FLAG_FIRST_PART | CEDARV_FLAG_LAST_PART | CEDARV_FLAG_PTS_VALID;
-    CEDARX_ENSURE(dec_->update_data(dec_, &info), false);
-    CEDARX_ENSURE(dec_->decode(dec_), false);
+    CEDARX_ENSURE(dec_->update_data(dec_.get(), &info), false);
+    CEDARX_ENSURE(dec_->decode(dec_.get()), false);
     cedarv_picture_t *pic = new cedarv_picture_t();
-    auto ret = dec_->display_request(dec_, pic);
+    auto ret = dec_->display_request(dec_.get(), pic);
     if (ret > 3 || ret < 0) {
         std::clog << "CedarV: display_request failed: " <<  ret << ", picture id: " << pic->id << std::endl;
         delete pic;
@@ -149,7 +150,7 @@ bool CedarXVideoDecoder::decode(const Packet& pkt)
     }
     //std::clog << "cedarv_picture_t.id: " << pic->id<< std::endl;
     auto buf = pool_->getBuffer(pic, [pic, this]{ // TODO: shared_ptr<dec_>
-        dec_->display_release(dec_, pic->id);
+        dec_->display_release(dec_.get(), pic->id);
         delete pic;
     });
     VideoFrame frame(pic->display_width, pic->display_height, PixelFormat::NV12, buf); // TODO: can be mapped as yuv420p, rgb24
