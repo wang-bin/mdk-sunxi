@@ -1,7 +1,7 @@
 /*
  * Copyright (c) 2018 WangBin <wbsecg1 at gmail.com>
  */
-// env: GL_UMP=0/1. GL_TILE=0/1
+// env: GL_UMP=0/1. GL_TILE=0/1, SIMD_TILE=0/1
 #include "mdk/VideoBuffer.h"
 #include "mdk/VideoFrame.h"
 #include "NativeVideoBufferTemplate.h"
@@ -14,7 +14,7 @@
 #include <memory>
 #include <mutex>
 extern "C" {
-#include <libcedarv/libcedarv.h>
+#include <libcedarv/libcedarv.h> // TODO: remove
 #include <ump/ump.h>
 #include <ump/ump_ref_drv.h>
 #include <EGL/fbdev_window.h>
@@ -30,6 +30,10 @@ PFNEGLDESTROYIMAGEKHRPROC eglDestroyImage = nullptr;
 // TODO: rename to UMPBuffer
 static void map32x32_to_yuv_Y(const void* srcY, void* tarY, unsigned int dst_pitch, unsigned int coded_width, unsigned int coded_height);
 static void map32x32_to_yuv_C(const void* srcC, void* tarCb, void* tarCr, unsigned int dst_pitch, unsigned int coded_width, unsigned int coded_height);
+extern "C" {
+void neon_tiled_to_planar(const void *src, void *dst, unsigned int dst_pitch, unsigned int width, unsigned int height);
+void neon_tiled_deinterleave_to_planar(const void *src, void *dst1, void *dst2, unsigned int dst_pitch, unsigned int width, unsigned int height);
+}
 
 typedef void (*map_y_t)(const void* src, void* dst, unsigned int dst_pitch, unsigned int w, unsigned int h);
 map_y_t map_y_ = map32x32_to_yuv_Y;
@@ -44,6 +48,14 @@ public:
         gl_ump_ = !env || atoi(env); // default is true
         env = getenv("GL_TILE");
         gl_tile_ = env && atoi(env); // default is true if tile to linear is supported by shader
+        env = getenv("SIMD_TILE");
+        if (!env || atoi(env)) {
+            map_y_ = neon_tiled_to_planar;
+            map_c_ = neon_tiled_deinterleave_to_planar;
+        } else {
+            map_y_ = map32x32_to_yuv_Y;
+            map_c_ = map32x32_to_yuv_C;   
+        }
     }
     ~CedarVBufferPool() override {
         ump_close();
