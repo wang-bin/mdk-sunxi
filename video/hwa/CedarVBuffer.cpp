@@ -1,25 +1,44 @@
 /*
  * Copyright (c) 2018 WangBin <wbsecg1 at gmail.com>
  */
+// env: GL_UMP=0/1
 #include "mdk/VideoBuffer.h"
 #include "mdk/VideoFrame.h"
 #include "NativeVideoBufferTemplate.h"
 #include "video/opengl/GLGlue.h"
 #include "ugl/gl_api.h" // egl_api.h is included if HAVE_EGL_CAPI is defined
+#include "ugl/egl_api.h"
 #include "ugl/context.h"
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <mutex>
 extern "C" {
 #include <libcedarv/libcedarv.h>
+#include <ump/ump.h>
+#include <ump/ump_ref_drv.h>
+#include <EGL/fbdev_window.h>
 }
 using namespace std;
 using namespace UGL_NS::opengl;
 #define FFALIGN(x, a) (((x)+(a)-1)&~((a)-1))
 
 MDK_NS_BEGIN
+PFNEGLCREATEIMAGEKHRPROC eglCreateImage = nullptr;
+PFNEGLDESTROYIMAGEKHRPROC eglDestroyImage = nullptr;
+
 class CedarVBufferPool final : public NativeVideoBufferPool {
 public:
+    CedarVBufferPool() {
+        ump_open();
+        const char* env = getenv("GL_UMP");
+        if (env && atoi(env))
+            use_ump_ = true;
+    }
+    ~CedarVBufferPool() override {
+        ump_close();
+    }
+
     NativeVideoBufferRef getBuffer(void* opaque, std::function<void()> cleanup = nullptr) override;
     bool transfer_begin(cedarv_picture_t* buf, NativeVideoBuffer::GLTextureArray* ma, NativeVideoBuffer::MapParameter *mp);
     void transfer_end() {}
@@ -35,15 +54,20 @@ private:
     }
 
     bool ensureGL(const VideoFormat& fmt, int* w, int* h);
+
     struct ctx_res_t {
+        int count = 2;
         GLuint tex[2] = {};
         GLenum format[4]{};
         GLenum data_type[4]{};
-        int count = 2;
+        fbdev_pixmap pixmap[2]{};
+        ump_handle ump[2]{};
+        EGLImageKHR img[2]{};
     };
     Context *ctx_ = nullptr; // used to check context change
     ctx_res_t* ctx_res_ = nullptr; // current cls value used
 
+    bool use_ump_ = false; // better performance. on sun4i 1080p bbb cpu load is about 50%, while host memory cpu is ~95%
     std::mutex hos_mutex_;
     VideoFrame host_;
 
@@ -52,6 +76,14 @@ private:
         for (auto& t : r.tex) {
             if (t)
                 gl().DeleteTextures(t, &t);
+        }
+        for (auto& img : r.img) {
+            if (img)
+                EGL_WARN(eglDestroyImage(eglGetCurrentDisplay(), img));
+        }
+        for (auto ump : r.ump) {
+            if (ump)
+                ump_reference_release(ump);
         }
     }};
 };
@@ -64,11 +96,34 @@ NativeVideoBufferRef CedarVBufferPool::getBuffer(void* opaque, std::function<voi
     return std::make_shared<CedarVBuffer>(static_pointer_cast<CedarVBufferPool>(shared_from_this()), static_cast<cedarv_picture_t*>(opaque), cleanup);    
 }
 
+static void fill_pixmap(fbdev_pixmap *pm, ump_handle umph, int width, int height, int bpp)
+{
+    memset(pm, 0, sizeof(*pm));
+    pm->bytes_per_pixel = bpp/8;
+    pm->buffer_size = bpp;
+    pm->luminance_size = 8;
+    pm->alpha_size = bpp - 8; // GL_LUMINANCE_ALPHA
+    pm->width = width;
+    pm->height = height;
+    pm->flags = FBDEV_PIXMAP_SUPPORTS_UMP;
+// https://github.com/agx/gst-plugins-bad/blob/master/ext/eglgles/video_platform_wrapper.c#L499-L569
+// https://github.com/peak3d/egltest
+    //pm->data = (decltype(pm->data))cedarv_virt2phys(mem); // cedarv_virt2phys()?
+    pm->data = (short unsigned int*)umph; // pixmapHandle =  ump_ref_drv_allocate( sizeOfBuffer  , UMP_REF_DRV_CONSTRAINT_NONE);
+    pm->format = 0;
+    //ump_reference_add(umph);
+    //ump_cpu_msync_now(umph, UMP_MSYNC_CLEAN_AND_INVALIDATE, 0, ump_size_get(umph));
+}
 
 bool CedarVBufferPool::ensureGL(const VideoFormat& fmt, int* w, int* h)
 {
     if (ctx_res_->tex[0])
         return true;
+    if (!eglCreateImage) {
+        eglCreateImage = (PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");
+        eglDestroyImage = (PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
+    }
+
     ctx_res_->count = fmt.planeCount();
     GLint tex_ifmt[4]{};
     toGL(fmt, tex_ifmt, ctx_res_->format, ctx_res_->data_type);
@@ -87,6 +142,17 @@ bool CedarVBufferPool::ensureGL(const VideoFormat& fmt, int* w, int* h)
         gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR); //GL_NEAREST?
         gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        if (use_ump_) {
+            ctx_res_->ump[i] = ump_ref_drv_allocate(fmt.bytesForPlane(w[0], h[0], i), UMP_REF_DRV_CONSTRAINT_PHYSICALLY_LINEAR); //UMP_REF_DRV_CONSTRAINT_USE_CACHE
+            fill_pixmap(&ctx_res_->pixmap[i], ctx_res_->ump[i], w[i], h[i], fmt.bitsPerPixel(i));
+            const EGLint imgattr[] = {
+                EGL_IMAGE_PRESERVED_KHR, EGL_FALSE, 
+                EGL_NONE
+            };
+            EGL_WARN(ctx_res_->img[i] = eglCreateImage(eglGetCurrentDisplay(), EGL_NO_CONTEXT, EGL_NATIVE_PIXMAP_KHR, (EGLClientBuffer)&ctx_res_->pixmap[i], imgattr));
+            gl.EGLImageTargetTexture2DOES(GL_TEXTURE_2D, ctx_res_->img[i]);
+            std::clog << "CedarV-UMP-EGLImage interop. plane " << i << " ump: " << ctx_res_->ump[i] << " +" << ump_size_get(ctx_res_->ump[i]) << ", eglimage: " << ctx_res_->img[i] << std::endl;
+        }
         gl.BindTexture(GL_TEXTURE_2D, 0);
     }
     return true;
@@ -101,7 +167,7 @@ bool CedarVBufferPool::transfer_begin(cedarv_picture_t* buf, NativeVideoBuffer::
     if (!ctx_res_) {
         ctx_res_ = &res.get(ctx_);
     }
-    const VideoFormat fmt = PixelFormat::NV12;
+    const VideoFormat fmt = PixelFormat::NV12T32x32;
     buf->display_height = FFALIGN(buf->display_height, 8);
     mp->width[0] = FFALIGN(buf->display_width, 16);
     mp->height[0] = FFALIGN(buf->display_height, 2); // already aligned to 8!
@@ -110,9 +176,15 @@ bool CedarVBufferPool::transfer_begin(cedarv_picture_t* buf, NativeVideoBuffer::
     const auto& gl = *ctx_->gl();
     const void* bits[] = {buf->y, buf->u};
     for (int i = 0; i < ctx_res_->count; ++i) {
-        gl.BindTexture(GL_TEXTURE_2D, ctx_res_->tex[i]);
-        gl.TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, fmt.width(mp->width[0], i), fmt.height(mp->height[0], i), ctx_res_->format[i], ctx_res_->data_type[i], bits[i]);
-        gl.BindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        if (use_ump_) {
+            //memcpy(ump_mapped_pointer_get(ctx_res_->ump[i]), bits[i], fmt.bytesForPlane(mp->width[0], mp->height[0], i));
+            //ump_mapped_pointer_release(ctx_res_->ump[i]);
+            ump_write(ctx_res_->ump[i], 0, bits[i], fmt.bytesForPlane(mp->width[0], mp->height[0], i));
+        } else {
+            gl.BindTexture(GL_TEXTURE_2D, ctx_res_->tex[i]);
+            gl.TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, fmt.width(mp->width[0], i), fmt.height(mp->height[0], i), ctx_res_->format[i], ctx_res_->data_type[i], bits[i]);
+            gl.BindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        }
         ma->id[i] = ctx_res_->tex[i];
         //printf("ma->id[%d]: %d, %dx%d @%p\n", i, ma->id[i], mp->width[i], mp->height[i], bits[i]);
     }
