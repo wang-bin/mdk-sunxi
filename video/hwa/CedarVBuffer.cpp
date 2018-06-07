@@ -1,7 +1,7 @@
 /*
  * Copyright (c) 2018 WangBin <wbsecg1 at gmail.com>
  */
-// env: GL_UMP=0/1
+// env: GL_UMP=0/1. GL_TILE=0/1
 #include "mdk/VideoBuffer.h"
 #include "mdk/VideoFrame.h"
 #include "NativeVideoBufferTemplate.h"
@@ -26,14 +26,24 @@ using namespace UGL_NS::opengl;
 MDK_NS_BEGIN
 PFNEGLCREATEIMAGEKHRPROC eglCreateImage = nullptr;
 PFNEGLDESTROYIMAGEKHRPROC eglDestroyImage = nullptr;
+// TODO: move tile->linear code to an individual file.
+// TODO: rename to UMPBuffer
+static void map32x32_to_yuv_Y(const void* srcY, void* tarY, unsigned int dst_pitch, unsigned int coded_width, unsigned int coded_height);
+static void map32x32_to_yuv_C(const void* srcC, void* tarCb, void* tarCr, unsigned int dst_pitch, unsigned int coded_width, unsigned int coded_height);
+
+typedef void (*map_y_t)(const void* src, void* dst, unsigned int dst_pitch, unsigned int w, unsigned int h);
+map_y_t map_y_ = map32x32_to_yuv_Y;
+typedef void (*map_c_t)(const void* src, void* dst1, void* dst2, unsigned int dst_pitch, unsigned int w, unsigned int h);
+map_c_t map_c_ = map32x32_to_yuv_C;
 
 class CedarVBufferPool final : public NativeVideoBufferPool {
 public:
     CedarVBufferPool() {
         ump_open();
         const char* env = getenv("GL_UMP");
-        if (env && atoi(env))
-            use_ump_ = true;
+        gl_ump_ = !env || atoi(env); // default is true
+        env = getenv("GL_TILE");
+        gl_tile_ = env && atoi(env); // default is true if tile to linear is supported by shader
     }
     ~CedarVBufferPool() override {
         ump_close();
@@ -67,7 +77,8 @@ private:
     Context *ctx_ = nullptr; // used to check context change
     ctx_res_t* ctx_res_ = nullptr; // current cls value used
 
-    bool use_ump_ = false; // better performance. on sun4i 1080p bbb cpu load is about 50%, while host memory cpu is ~95%
+    bool gl_ump_ = true; // better performance. on sun4i 1080p bbb cpu load is about 50%, while host memory cpu is ~95%
+    bool gl_tile_ = false;
     std::mutex hos_mutex_;
     VideoFrame host_;
 
@@ -142,7 +153,7 @@ bool CedarVBufferPool::ensureGL(const VideoFormat& fmt, int* w, int* h)
         gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR); //GL_NEAREST?
         gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        if (use_ump_) {
+        if (gl_ump_) {
             ctx_res_->ump[i] = ump_ref_drv_allocate(fmt.bytesForPlane(w[0], h[0], i), UMP_REF_DRV_CONSTRAINT_PHYSICALLY_LINEAR); //UMP_REF_DRV_CONSTRAINT_USE_CACHE
             fill_pixmap(&ctx_res_->pixmap[i], ctx_res_->ump[i], w[i], h[i], fmt.bitsPerPixel(i));
             const EGLint imgattr[] = {
@@ -171,15 +182,22 @@ bool CedarVBufferPool::transfer_begin(cedarv_picture_t* buf, NativeVideoBuffer::
     buf->display_height = FFALIGN(buf->display_height, 8);
     mp->width[0] = FFALIGN(buf->display_width, 16);
     mp->height[0] = FFALIGN(buf->display_height, 2); // already aligned to 8!
+    mp->width[1] = fmt.width(mp->width[0], 1);
+    mp->height[1] = fmt.height(mp->height[0], 1);
+    mp->stride[0] = mp->width[0];
+    mp->stride[1] = mp->width[0]; // uv plane
     if (!ensureGL(fmt, mp->width, mp->height))
         return false;
     const auto& gl = *ctx_->gl();
     const void* bits[] = {buf->y, buf->u};
     for (int i = 0; i < ctx_res_->count; ++i) {
-        if (use_ump_) {
-            //memcpy(ump_mapped_pointer_get(ctx_res_->ump[i]), bits[i], fmt.bytesForPlane(mp->width[0], mp->height[0], i));
-            //ump_mapped_pointer_release(ctx_res_->ump[i]);
-            ump_write(ctx_res_->ump[i], 0, bits[i], fmt.bytesForPlane(mp->width[0], mp->height[0], i));
+        if (gl_ump_) {
+            if (gl_tile_) {
+                ump_write(ctx_res_->ump[i], 0, bits[i], fmt.bytesForPlane(mp->width[0], mp->height[0], i));
+            } else {
+                map_y_(bits[i], (void*)ump_mapped_pointer_get(ctx_res_->ump[i]), mp->stride[i], mp->width[0] /* because use map_y_*/, mp->height[i]);
+                ump_mapped_pointer_release(ctx_res_->ump[i]);
+            }
         } else {
             gl.BindTexture(GL_TEXTURE_2D, ctx_res_->tex[i]);
             gl.TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, fmt.width(mp->width[0], i), fmt.height(mp->height[0], i), ctx_res_->format[i], ctx_res_->data_type[i], bits[i]);
@@ -194,7 +212,7 @@ bool CedarVBufferPool::transfer_begin(cedarv_picture_t* buf, NativeVideoBuffer::
 }
 
 // source data is colum major. every block is 32x32
-static void map32x32_to_yuv_Y(void* srcY, void* tarY, unsigned int dst_pitch, unsigned int coded_width, unsigned int coded_height)
+void map32x32_to_yuv_Y(const void* srcY, void* tarY, unsigned int dst_pitch, unsigned int coded_width, unsigned int coded_height)
 {
     unsigned long offset;
     unsigned char *ptr = (unsigned char *)srcY;
@@ -225,7 +243,7 @@ static void map32x32_to_yuv_Y(void* srcY, void* tarY, unsigned int dst_pitch, un
     }
 }
 
-static void map32x32_to_yuv_C(void* srcC, void* tarCb, void* tarCr, unsigned int dst_pitch, unsigned int coded_width, unsigned int coded_height)
+void map32x32_to_yuv_C(const void* srcC, void* tarCb, void* tarCr, unsigned int dst_pitch, unsigned int coded_width, unsigned int coded_height)
 {
     coded_width /= 2; // libvdpau-sunxi compatible
     unsigned char line[32];
@@ -268,34 +286,29 @@ static void map32x32_to_yuv_C(void* srcC, void* tarCb, void* tarCr, unsigned int
     }
 }
 
-typedef void (*map_y_t)(void* src, void* dst, unsigned int dst_pitch, unsigned int w, unsigned int h);
-map_y_t map_y_ = map32x32_to_yuv_Y;
-typedef void (*map_c_t)(void* src, void* dst1, void* dst2, unsigned int dst_pitch, unsigned int w, unsigned int h);
-map_c_t map_c_ = map32x32_to_yuv_C;
-
 bool CedarVBufferPool::transfer_to_host(cedarv_picture_t* buf, NativeVideoBuffer::MemoryArray* ma, NativeVideoBuffer::MapParameter *mp)
 {
     if (ma->data[0]) // can be reused
         return true;
     buf->display_height = FFALIGN(buf->display_height, 8);
-    const int display_h_align = FFALIGN(buf->display_height, 2); // already aligned to 8!
-    const int display_w_align = FFALIGN(buf->display_width, 16);
-    const int dst_y_stride = display_w_align;
+    const int w = FFALIGN(buf->display_width, 16);
+    const int h = FFALIGN(buf->display_height, 2); // already aligned to 8!
+    const int dst_y_stride = w;
     //const int dst_c_stride = FFALIGN(buf->display_width/2, 16);
     mp->stride[0] = dst_y_stride;
     mp->stride[1] = dst_y_stride; // uv plane
     std::lock_guard<std::mutex> lock(hos_mutex_);
-    if (host_.width() != display_w_align || host_.height() != display_h_align)
-        host_ = VideoFrame(display_w_align, display_h_align, PixelFormat::NV12, mp->stride);
-    ma->data[0] = host_.buffer(0)->data();
-    ma->data[1] = host_.buffer(1)->data();
-    mp->format = PixelFormat::NV12;
-    if (map_y_) {
-        map_y_(buf->y, (void*)ma->data[0], display_w_align, mp->stride[0], display_h_align);
-        map_y_(buf->u, (void*)ma->data[1], mp->stride[1], display_w_align, display_h_align/2);
-    } else {
-        memcpy((void*)ma->data[0], buf->y, mp->stride[0]*display_h_align);
-        memcpy((void*)ma->data[1], buf->u, mp->stride[1]*display_h_align/2);
+    const VideoFormat fmt = PixelFormat::NV12;
+    mp->format = fmt;
+    if (host_.width() != w || host_.height() != h)
+        host_ = VideoFrame(w, h, fmt, mp->stride);
+    const void* bits[] = {buf->y, buf->u};
+    for (int i = 0; i < fmt.planeCount(); ++i) {
+        ma->data[i] = host_.buffer(i)->data();
+        if (gl_tile_)
+            memcpy(ma->data[i], bits[i], fmt.bytesForPlane(w, h, i));
+        else
+            map_y_(bits[i], ma->data[i], mp->stride[i], fmt.bytesPerLine(w, i)/*because use map_y_*/, fmt.height(h, i));
     }
     return true;
 }
