@@ -18,6 +18,11 @@ extern "C" {
 #include <ump/ump.h>
 #include <ump/ump_ref_drv.h>
 #include <EGL/fbdev_window.h>
+
+#include "sunxi_disp_ioctl.h"
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
 }
 using namespace std;
 using namespace UGL_NS::opengl;
@@ -27,7 +32,8 @@ MDK_NS_BEGIN
 PFNEGLCREATEIMAGEKHRPROC eglCreateImage = nullptr;
 PFNEGLDESTROYIMAGEKHRPROC eglDestroyImage = nullptr;
 // TODO: move tile->linear code to an individual file.
-// TODO: rename to UMPBuffer
+// TODO: rename to UMPBuffer which can be used for other platforms
+// TODO: no libcedarv.h dependency, use generic struct contains ptrs, and is_ump flag
 static void map32x32_to_yuv_Y(const void* srcY, void* tarY, unsigned int dst_pitch, unsigned int coded_width, unsigned int coded_height);
 static void map32x32_to_yuv_C(const void* srcC, void* tarCb, void* tarCr, unsigned int dst_pitch, unsigned int coded_width, unsigned int coded_height);
 extern "C" {
@@ -56,8 +62,13 @@ public:
             map_y_ = map32x32_to_yuv_Y;
             map_c_ = map32x32_to_yuv_C;   
         }
+        env = getenv("DISP_TILE");
+        if (!env || atoi(env))
+            disp_fd_ = ::open("/dev/disp", O_RDWR);
     }
     ~CedarVBufferPool() override {
+        if (disp_fd_)
+            ::close(disp_fd_);
         ump_close();
     }
 
@@ -91,6 +102,7 @@ private:
 
     bool gl_ump_ = true; // better performance. on sun4i 1080p bbb cpu load is about 50%, while host memory cpu is ~95%
     bool gl_tile_ = false;
+    int disp_fd_ = -1;
     std::mutex hos_mutex_;
     VideoFrame host_;
 
@@ -119,13 +131,61 @@ NativeVideoBufferRef CedarVBufferPool::getBuffer(void* opaque, std::function<voi
     return std::make_shared<CedarVBuffer>(static_pointer_cast<CedarVBufferPool>(shared_from_this()), static_cast<cedarv_picture_t*>(opaque), cleanup);    
 }
 
+static bool disp_tiled_to_linear(int fd, int width, int height, const void* y, const void* uv, void* dst)
+{
+    unsigned long arg[4]{}; 
+    // arg[0]: screen 0/1, https://linux-sunxi.org/Sunxi_disp_driver_interface/IOCTL#Scaler_IOCTLs
+    int scaler = ioctl(fd, DISP_CMD_SCALER_REQUEST, (unsigned long)arg);
+    if (scaler == -1) {
+        std::clog << "failed to request scaler from display engine" << std::endl;
+        return false;
+    }
+    arg[1] = scaler;
+    __disp_scaler_para_t p{};
+    p.input_fb.addr[0] = (__u32)y;
+    p.input_fb.addr[1] = (__u32)uv;
+    p.input_fb.size.width = width;
+    p.input_fb.size.height = height;
+    p.input_fb.format = DISP_FORMAT_YUV420;
+    p.input_fb.seq = DISP_SEQ_UVUV;
+    p.input_fb.mode = DISP_MOD_MB_UV_COMBINED;
+    p.input_fb.br_swap = 0;
+    p.input_fb.cs_mode = DISP_BT601; // TODO 709?
+    p.source_regn.x = 0;
+    p.source_regn.y = 0;
+    p.source_regn.width = width;
+    p.source_regn.height = height;
+    p.output_fb.addr[0] = (__u32)dst;
+    p.output_fb.size.width = width;
+    p.output_fb.size.height = height;
+    p.output_fb.format = DISP_FORMAT_ARGB888;//DISP_FORMAT_YUV420;
+    p.output_fb.seq = DISP_SEQ_BGRA;//DISP_SEQ_P3210/*yuv420 p*/;//DISP_SEQ_UVUV;
+    p.output_fb.mode = DISP_MOD_INTERLEAVED;//DISP_MOD_NON_MB_PLANAR; // DISP_MOD_NON_MB_UV_COMBINED: invalid in Display_Scaler_Start. https://github.com/linux-sunxi/linux-sunxi/blob/sunxi-3.4/drivers/video/sunxi/disp/disp_scaler.c#L894
+    p.output_fb.br_swap = 0;
+    p.output_fb.cs_mode = DISP_BT601;
+    arg[2] = (unsigned long)&p;
+    if (ioctl(fd, DISP_CMD_SCALER_EXECUTE, (unsigned long)arg) < 0) {
+        std::clog << "failed to scale video by display engine " << fd << std::endl;
+        return false;
+    }
+    ioctl(fd, DISP_CMD_SCALER_RELEASE, (unsigned long)arg);
+    return true;
+}
+
 static void fill_pixmap(fbdev_pixmap *pm, ump_handle umph, int width, int height, int bpp)
 {
     memset(pm, 0, sizeof(*pm));
     pm->bytes_per_pixel = bpp/8;
     pm->buffer_size = bpp;
-    pm->luminance_size = 8;
-    pm->alpha_size = bpp - 8; // GL_LUMINANCE_ALPHA
+    if (bpp >= 24) { // rgb
+        pm->red_size = 8;
+        pm->green_size = 8;
+        pm->blue_size = 8;
+        pm->alpha_size = bpp - 24;
+    } else {
+        pm->luminance_size = 8;
+    }
+    pm->alpha_size = bpp - pm->red_size - pm->green_size - pm->blue_size - pm->luminance_size; // GL_LUMINANCE_ALPHA
     pm->width = width;
     pm->height = height;
     pm->flags = FBDEV_PIXMAP_SUPPORTS_UMP;
@@ -136,6 +196,7 @@ static void fill_pixmap(fbdev_pixmap *pm, ump_handle umph, int width, int height
     pm->format = 0;
     //ump_reference_add(umph);
     //ump_cpu_msync_now(umph, UMP_MSYNC_CLEAN_AND_INVALIDATE, 0, ump_size_get(umph));
+    printf("fbdev pixmap bpp=%d rgba=(%d,%d,%d,%d), l: %d, ", pm->bytes_per_pixel, pm->red_size, pm->green_size, pm->blue_size, pm->alpha_size, pm->luminance_size);
 }
 
 bool CedarVBufferPool::ensureGL(const VideoFormat& fmt, int* w, int* h)
@@ -152,14 +213,10 @@ bool CedarVBufferPool::ensureGL(const VideoFormat& fmt, int* w, int* h)
     toGL(fmt, tex_ifmt, ctx_res_->format, ctx_res_->data_type);
     const auto& gl = UGL_NS::opengl::gl(); // *ctx_->gl()
     gl.GenTextures(ctx_res_->count, ctx_res_->tex);
-    std::clog << "CedarV-GL interop: upload tiled image to gl texture directly" << std::endl;
+    std::clog << "CedarV-GL interop" << std::endl;
     for (size_t i = 0; i < ctx_res_->count; ++i) {
         GLuint& t = ctx_res_->tex[i];
         gl.BindTexture(GL_TEXTURE_2D, t);
-        if (w[i] <= 0)
-            w[i] = fmt.width(w[0], i);
-        if (h[i] <= 0)
-            h[i] = fmt.height(h[0], i);
         gl.TexImage2D(GL_TEXTURE_2D, 0, tex_ifmt[i], w[i], h[i], 0, ctx_res_->format[i], ctx_res_->data_type[i], nullptr);
         gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
@@ -190,7 +247,18 @@ bool CedarVBufferPool::transfer_begin(cedarv_picture_t* buf, NativeVideoBuffer::
     if (!ctx_res_) {
         ctx_res_ = &res.get(ctx_);
     }
-    const VideoFormat fmt = PixelFormat::NV12T32x32;
+    if (disp_fd_ >= 0) {
+        unsigned long screen = 0;
+        int scaler = ioctl(disp_fd_, DISP_CMD_SCALER_REQUEST, &screen);
+        if (scaler == -1) {
+            std::clog << "faild to request scaler from display engine " << disp_fd_ << std::endl;
+            ::close(disp_fd_);
+            disp_fd_ = -1;
+        } else {
+            std::clog << "using scaler from display engine" << std::endl;
+        }
+    }
+    const VideoFormat fmt = disp_fd_ >= 0 ? PixelFormat::RGBA : PixelFormat::NV12T32x32;
     buf->display_height = FFALIGN(buf->display_height, 8);
     mp->width[0] = FFALIGN(buf->display_width, 16);
     mp->height[0] = FFALIGN(buf->display_height, 2); // already aligned to 8!
@@ -200,8 +268,24 @@ bool CedarVBufferPool::transfer_begin(cedarv_picture_t* buf, NativeVideoBuffer::
     mp->stride[1] = mp->width[0]; // uv plane
     if (!ensureGL(fmt, mp->width, mp->height))
         return false;
+    ma->target = GL_TEXTURE_2D;
+    mp->format = fmt;
     const auto& gl = *ctx_->gl();
     const void* bits[] = {buf->y, buf->u};
+    if (disp_fd_ >= 0) {
+        void* dst = (void*)ump_mapped_pointer_get(ctx_res_->ump[0]);
+        const bool ret = disp_tiled_to_linear(disp_fd_, mp->width[0], mp->height[0], bits[0], bits[1], dst);
+        ump_mapped_pointer_release(ctx_res_->ump[0]);
+        if (ret) {
+            ma->id[0] = ctx_res_->tex[0];
+            ma->id[1] = ctx_res_->tex[1];
+            return true;
+        } else {
+            std::clog << "Failed to convert tiled to linear nv12 by disp device. Fallback to cpu or gl shader conversion" << std::endl;
+            ::close(disp_fd_);
+            disp_fd_ = -1;
+        }
+    }
     for (int i = 0; i < ctx_res_->count; ++i) {
         if (gl_ump_) {
             if (gl_tile_) {
@@ -218,8 +302,6 @@ bool CedarVBufferPool::transfer_begin(cedarv_picture_t* buf, NativeVideoBuffer::
         ma->id[i] = ctx_res_->tex[i];
         //printf("ma->id[%d]: %d, %dx%d @%p\n", i, ma->id[i], mp->width[i], mp->height[i], bits[i]);
     }
-    ma->target = GL_TEXTURE_2D;
-    mp->format = fmt;
     return true;
 }
 
