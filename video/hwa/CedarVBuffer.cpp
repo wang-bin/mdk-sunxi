@@ -1,7 +1,7 @@
 /*
  * Copyright (c) 2018 WangBin <wbsecg1 at gmail.com>
  */
-// env: GL_UMP=0/1. GL_TILE=0/1, SIMD_TILE=0/1
+// env: GL_UMP=0/1/2(0: no ump, 1: input is host output is ump, 2:input is ump). GL_TILE=0/1, SIMD_TILE=0/1
 #include "mdk/VideoBuffer.h"
 #include "mdk/VideoFrame.h"
 #include "NativeVideoBufferTemplate.h"
@@ -33,7 +33,7 @@ PFNEGLCREATEIMAGEKHRPROC eglCreateImage = nullptr;
 PFNEGLDESTROYIMAGEKHRPROC eglDestroyImage = nullptr;
 // TODO: move tile->linear code to an individual file.
 // TODO: rename to UMPBuffer which can be used for other platforms
-// TODO: no libcedarv.h dependency, use generic struct contains ptrs, and is_ump flag
+// TODO: no libcedarv.h dependency, use generic struct contains ptrs, and is_ump flag. if picture is ump, no copy
 static void map32x32_to_yuv_Y(const void* srcY, void* tarY, unsigned int dst_pitch, unsigned int coded_width, unsigned int coded_height);
 static void map32x32_to_yuv_C(const void* srcC, void* tarCb, void* tarCr, unsigned int dst_pitch, unsigned int coded_width, unsigned int coded_height);
 extern "C" {
@@ -63,11 +63,25 @@ public:
             map_c_ = map32x32_to_yuv_C;   
         }
         env = getenv("DISP_TILE");
-        if (!env || atoi(env))
+        if (env && atoi(env))
             disp_fd_ = ::open("/dev/disp", O_RDWR);
+        if (disp_fd_ >= 0) {
+            unsigned long screen = 0;
+            int scaler = ioctl(disp_fd_, DISP_CMD_SCALER_REQUEST, &screen);
+            std::clog << "scaler from display engine in screen " << screen << ": " << scaler << std::endl;
+            if (scaler == -1) {
+                std::clog << "failed to request scaler from display engine " << disp_fd_ << std::endl;
+                ::close(disp_fd_);
+                disp_fd_ = -1;
+            } else {
+                unsigned long arg[] = {screen, (unsigned long)scaler};
+                ioctl(disp_fd_, DISP_CMD_SCALER_RELEASE, arg);
+                std::clog << "using scaler from display engine " << disp_fd_ << std::endl;
+            }
+        }
     }
     ~CedarVBufferPool() override {
-        if (disp_fd_)
+        if (disp_fd_ >= 0)
             ::close(disp_fd_);
         ump_close();
     }
@@ -137,7 +151,7 @@ static bool disp_tiled_to_linear(int fd, int width, int height, const void* y, c
     // arg[0]: screen 0/1, https://linux-sunxi.org/Sunxi_disp_driver_interface/IOCTL#Scaler_IOCTLs
     int scaler = ioctl(fd, DISP_CMD_SCALER_REQUEST, (unsigned long)arg);
     if (scaler == -1) {
-        std::clog << "failed to request scaler from display engine" << std::endl;
+        std::clog << "failed to request scaler from display engine " << fd << std::endl;
         return false;
     }
     arg[1] = scaler;
@@ -158,18 +172,23 @@ static bool disp_tiled_to_linear(int fd, int width, int height, const void* y, c
     p.output_fb.addr[0] = (__u32)dst;
     p.output_fb.size.width = width;
     p.output_fb.size.height = height;
-    p.output_fb.format = DISP_FORMAT_ARGB888;//DISP_FORMAT_YUV420;
+    // https://github.com/linux-sunxi/linux-sunxi/blob/sunxi-3.4/drivers/video/sunxi/disp/disp_scaler.c#L893
+    // mode+format: DISP_MOD_NON_MB_PLANAR + DISP_FB_TYPE_YUV
+    // mode+format: DISP_MOD_INTERLEAVED+DISP_FORMAT_ARGB8888, or (planar rgb?)DISP_MOD_NON_MB_PLANAR + DISP_FORMAT_RGB888|DISP_FORMAT_ARGB8888
+    p.output_fb.format = DISP_FORMAT_ARGB8888;//DISP_FORMAT_YUV420;
     p.output_fb.seq = DISP_SEQ_BGRA;//DISP_SEQ_P3210/*yuv420 p*/;//DISP_SEQ_UVUV;
     p.output_fb.mode = DISP_MOD_INTERLEAVED;//DISP_MOD_NON_MB_PLANAR; // DISP_MOD_NON_MB_UV_COMBINED: invalid in Display_Scaler_Start. https://github.com/linux-sunxi/linux-sunxi/blob/sunxi-3.4/drivers/video/sunxi/disp/disp_scaler.c#L894
     p.output_fb.br_swap = 0;
     p.output_fb.cs_mode = DISP_BT601;
     arg[2] = (unsigned long)&p;
-    if (ioctl(fd, DISP_CMD_SCALER_EXECUTE, (unsigned long)arg) < 0) {
-        std::clog << "failed to scale video by display engine " << fd << std::endl;
+    int ret = ioctl(fd, DISP_CMD_SCALER_EXECUTE, (unsigned long)arg);
+    if (ret < 0) // need to release scaler too
+        std::clog << " failed to scale video by display engine, errno " << errno << std::endl;
+    if (ioctl(fd, DISP_CMD_SCALER_RELEASE, (unsigned long)arg) != 0) {
+        std::clog << errno << " failed to release scaler from display engine " << fd << std::endl;
         return false;
     }
-    ioctl(fd, DISP_CMD_SCALER_RELEASE, (unsigned long)arg);
-    return true;
+    return ret >= 0;
 }
 
 static void fill_pixmap(fbdev_pixmap *pm, ump_handle umph, int width, int height, int bpp)
@@ -246,17 +265,6 @@ bool CedarVBufferPool::transfer_begin(cedarv_picture_t* buf, NativeVideoBuffer::
         return false;
     if (!ctx_res_) {
         ctx_res_ = &res.get(ctx_);
-    }
-    if (disp_fd_ >= 0) {
-        unsigned long screen = 0;
-        int scaler = ioctl(disp_fd_, DISP_CMD_SCALER_REQUEST, &screen);
-        if (scaler == -1) {
-            std::clog << "faild to request scaler from display engine " << disp_fd_ << std::endl;
-            ::close(disp_fd_);
-            disp_fd_ = -1;
-        } else {
-            std::clog << "using scaler from display engine" << std::endl;
-        }
     }
     const VideoFormat fmt = disp_fd_ >= 0 ? PixelFormat::RGBA : PixelFormat::NV12T32x32;
     buf->display_height = FFALIGN(buf->display_height, 8);
