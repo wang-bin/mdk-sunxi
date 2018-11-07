@@ -11,6 +11,7 @@
 extern "C" {
 #include <libcedarv/libcedarv.h>
 }
+// TODO: libcedarv allocate memory by ump, and add picture ump flag
 MDK_NS_BEGIN
 using namespace std;
 class CedarXVideoDecoder final : public VideoDecoder
@@ -19,7 +20,10 @@ public:
     const char* name() const override {return "CedarX";}
     bool open() override;
     bool close() override;
-    bool flush() override {return true;}
+    bool flush() override {
+        onFlush();
+        return true;
+    }
     bool decode(const Packet& pkt) override;
 private:
     shared_ptr<CEDARV_DECODER> dec_;
@@ -95,7 +99,6 @@ bool CedarXVideoDecoder::open()
             libcedarv_exit(dec);
         });
     }
-
     cedarv_stream_info_t info{};
     info.format = format;
     info.sub_format = sub_format;
@@ -109,6 +112,7 @@ bool CedarXVideoDecoder::open()
     CEDARX_ENSURE(dec_->open(dec_.get()), false);
     dec_->ioctrl(dec_.get(), CEDARV_COMMAND_RESET, 0);
     dec_->ioctrl(dec_.get(), CEDARV_COMMAND_PLAY, 0);
+    onOpen();
     return true;
 }
 
@@ -118,6 +122,7 @@ bool CedarXVideoDecoder::close()
         return true;
     dec_->ioctrl(dec_.get(), CEDARV_COMMAND_STOP, 0);
     dec_.reset();
+    onClose();
     return true;
 }
 
