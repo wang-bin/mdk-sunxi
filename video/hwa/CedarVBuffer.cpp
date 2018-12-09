@@ -272,10 +272,10 @@ bool CedarVBufferPool::ensureGL(const VideoFormat& fmt, int* w, int* h)
 
 bool CedarVBufferPool::transfer_begin(cedarv_picture_t* buf, NativeVideoBuffer::GLTextureArray* ma, NativeVideoBuffer::MapParameter *mp)
 {
-    if (ma->id[0] > 0)
-        return true;
     if (!updateContext())
         return false;
+    if (ma->id[0] > 0 && ma->test_set_glctx(ctx_->id()))
+        return true;
     if (!ctx_res_) {
         ctx_res_ = &res.get(ctx_);
     }
