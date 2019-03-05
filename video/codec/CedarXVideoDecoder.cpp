@@ -1,6 +1,6 @@
 
 /*
- * Copyright (c) 2018 WangBin <wbsecg1 at gmail.com>
+ * Copyright (c) 2018-2019 WangBin <wbsecg1 at gmail.com>
  * Original code is from QtAV project
  */
 #include "mdk/VideoDecoder.h"
@@ -33,9 +33,9 @@ private:
 #define CEDARX_ENSURE(f, ...) CEDARX_CHECK(f, return __VA_ARGS__;)
 #define CEDARX_WARN(f) CEDARX_CHECK(f)
 #define CEDARX_CHECK(f, ...)  do { \
-        int ret = f; \
-        if (ret < 0) { \
-            std::clog << #f "  ERROR@" << __LINE__ << __FUNCTION__ << ": (" << ret << ") " << std::endl; \
+        int __cedar_ret__ = f; \
+        if (__cedar_ret__ < 0) { \
+            std::clog << #f "  ERROR@" << __LINE__ << __FUNCTION__ << ": (" << __cedar_ret__ << ") " << std::endl; \
             __VA_ARGS__ \
         } \
     } while (false)
