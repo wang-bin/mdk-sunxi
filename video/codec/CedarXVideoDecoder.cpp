@@ -142,7 +142,7 @@ bool CedarXVideoDecoder::decode(const Packet& pkt)
     cedarv_stream_data_info_t info;
     info.type = 0; // TODO
     info.lengh = pkt.buffer->size();
-    info.pts = pkt.pts * 1000.0;
+    info.pts = pkt.pts * TimeScaleForInt;
     info.flags = CEDARV_FLAG_FIRST_PART | CEDARV_FLAG_LAST_PART | CEDARV_FLAG_PTS_VALID;
     CEDARX_ENSURE(dec_->update_data(dec_.get(), &info), false);
     CEDARX_ENSURE(dec_->decode(dec_.get()), false);
@@ -159,7 +159,7 @@ bool CedarXVideoDecoder::decode(const Packet& pkt)
         delete pic;
     });
     VideoFrame frame(pic->display_width, pic->display_height, PixelFormat::NV12, buf); // TODO: can be mapped as yuv420p, rgb24
-    frame.setTimestamp(double(pic->pts)/1000.0);
+    frame.setTimestamp(double(pic->pts)/TimeScaleForInt);
     frameDecoded(frame);
     return !pkt.isEnd();
 }
