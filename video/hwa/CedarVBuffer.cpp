@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018 WangBin <wbsecg1 at gmail.com>
+ * Copyright (c) 2018-2019 WangBin <wbsecg1 at gmail.com>
  */
 // env: EGLIMAGE_UMP=0/1/2(0: no ump, 1: input is host output is ump, 2:input is ump). GL_TILE=0/1, SIMD_TILE=0/1
 // EGLIMAGE_MEM=1 if EGLIMAGE_UMP==0: use host memory as fbdev_pixmap
@@ -131,7 +131,7 @@ private:
         std::clog << "release CedarV-GL interop resources" << std::endl;
         for (auto& t : r.tex) {
             if (t)
-                gl().DeleteTextures(t, &t);
+                gl().DeleteTextures(1, &t);
         }
         for (auto& img : r.img) {
             if (img)
