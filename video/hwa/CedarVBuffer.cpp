@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2019 WangBin <wbsecg1 at gmail.com>
+ * Copyright (c) 2018-2020 WangBin <wbsecg1 at gmail.com>
  */
 // env: EGLIMAGE_UMP=0/1/2(0: no ump, 1: input is host output is ump, 2:input is ump). GL_TILE=0/1, SIMD_TILE=0/1
 // EGLIMAGE_MEM=1 if EGLIMAGE_UMP==0: use host memory as fbdev_pixmap
@@ -8,7 +8,6 @@
 #include "NativeVideoBufferTemplate.h"
 #include "video/opengl/GLGlue.h"
 #include "ugl/gl_api.h" // egl_api.h is included if HAVE_EGL_CAPI is defined
-#include "ugl/egl_api.h"
 #include "ugl/context.h"
 #include <cstdlib>
 #include <iostream>
@@ -25,6 +24,8 @@ extern "C" {
 #include <sys/ioctl.h>
 #include <unistd.h>
 }
+#include "ugl/egl_api.h" //include last to avoid covering types later
+#include <EGL/eglext.h>
 using namespace std;
 using namespace UGL_NS::opengl;
 #define FFALIGN(x, a) (((x)+(a)-1)&~((a)-1))
@@ -66,7 +67,7 @@ public:
             map_c_ = neon_tiled_deinterleave_to_planar;
         } else {
             map_y_ = map32x32_to_yuv_Y;
-            map_c_ = map32x32_to_yuv_C;   
+            map_c_ = map32x32_to_yuv_C;
         }
         env = getenv("DISP_TILE");
         if (env && atoi(env))
@@ -149,12 +150,12 @@ using CedarVBuffer = NativeVideoBufferImpl<cedarv_picture_t*, CedarVBufferPool>;
 
 NativeVideoBufferRef CedarVBufferPool::getBuffer(void* opaque, std::function<void()> cleanup)
 {
-    return std::make_shared<CedarVBuffer>(static_pointer_cast<CedarVBufferPool>(shared_from_this()), static_cast<cedarv_picture_t*>(opaque), cleanup);    
+    return std::make_shared<CedarVBuffer>(static_pointer_cast<CedarVBufferPool>(shared_from_this()), static_cast<cedarv_picture_t*>(opaque), cleanup);
 }
 
 static bool disp_tiled_to_linear(int fd, int width, int height, const void* y, const void* uv, void* dst)
 {
-    unsigned long arg[4]{}; 
+    unsigned long arg[4]{};
     // arg[0]: screen 0/1, https://linux-sunxi.org/Sunxi_disp_driver_interface/IOCTL#Scaler_IOCTLs
     int scaler = ioctl(fd, DISP_CMD_SCALER_REQUEST, (unsigned long)arg);
     if (scaler == -1) {
@@ -254,7 +255,7 @@ bool CedarVBufferPool::ensureGL(const VideoFormat& fmt, int* w, int* h)
             ctx_res_->ump[i] = ump_ref_drv_allocate(fmt.bytesForPlane(w[0], h[0], i), ump_alloc_constraints(UMP_REF_DRV_CONSTRAINT_PHYSICALLY_LINEAR|UMP_REF_DRV_CONSTRAINT_USE_CACHE)); //UMP_REF_DRV_CONSTRAINT_USE_CACHE
             fill_pixmap(&ctx_res_->pixmap[i], nullptr, ctx_res_->ump[i], w[i], h[i], fmt.bitsPerPixel(i));
             const EGLint imgattr[] = {
-                EGL_IMAGE_PRESERVED_KHR, EGL_FALSE, 
+                EGL_IMAGE_PRESERVED_KHR, EGL_FALSE,
                 EGL_NONE
             };
             EGL_WARN(ctx_res_->img[i] = eglCreateImage(eglGetCurrentDisplay(), EGL_NO_CONTEXT, EGL_NATIVE_PIXMAP_KHR, (EGLClientBuffer)&ctx_res_->pixmap[i], imgattr));
@@ -329,7 +330,7 @@ bool CedarVBufferPool::transfer_begin(cedarv_picture_t* buf, NativeVideoBuffer::
                 }
                 fill_pixmap(&ctx_res_->pixmap[i], bits[i], ctx_res_->ump[i], mp->width[i],  mp->height[i], fmt.bitsPerPixel(i));
                 const EGLint imgattr[] = {
-                    EGL_IMAGE_PRESERVED_KHR, EGL_FALSE, 
+                    EGL_IMAGE_PRESERVED_KHR, EGL_FALSE,
                     EGL_NONE
                 };
                 EGL_WARN(ctx_res_->img[i] = eglCreateImage(eglGetCurrentDisplay(), EGL_NO_CONTEXT, EGL_NATIVE_PIXMAP_KHR, (EGLClientBuffer)&ctx_res_->pixmap[i], imgattr));
