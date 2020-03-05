@@ -1,6 +1,6 @@
 
 /*
- * Copyright (c) 2018-2019 WangBin <wbsecg1 at gmail.com>
+ * Copyright (c) 2018-2020 WangBin <wbsecg1 at gmail.com>
  * Original code is from QtAV project
  */
 #include "mdk/VideoDecoder.h"
@@ -151,7 +151,7 @@ bool CedarXVideoDecoder::decode(const Packet& pkt)
     if (ret > 3 || ret < 0) {
         std::clog << "CedarV: display_request failed: " <<  ret << ", picture id: " << pic->id << std::endl;
         delete pic;
-        return false;
+        return true; // do not treat as error because FrameReader will stop decoding if decode returns false. why ret == -1 at the beginning?
     }
     //std::clog << "cedarv_picture_t.id: " << pic->id<< std::endl;
     auto buf = pool_->getBuffer(pic, [pic, this]{ // TODO: shared_ptr<dec_>
