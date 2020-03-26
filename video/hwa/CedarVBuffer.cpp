@@ -17,7 +17,7 @@ extern "C" {
 #include <libcedarv/libcedarv.h> // TODO: remove
 #include <ump/ump.h>
 #include <ump/ump_ref_drv.h>
-#include <EGL/fbdev_window.h>
+//#include <EGL/fbdev_window.h>
 
 #include "sunxi_disp_ioctl.h"
 #include <fcntl.h>
@@ -31,6 +31,31 @@ using namespace UGL_NS::opengl;
 #define FFALIGN(x, a) (((x)+(a)-1)&~((a)-1))
 
 MDK_NS_BEGIN
+typedef enum
+{
+        FBDEV_PIXMAP_DEFAULT = 0,
+        FBDEV_PIXMAP_SUPPORTS_UMP = (1<<0),
+        FBDEV_PIXMAP_ALPHA_FORMAT_PRE = (1<<1),
+        FBDEV_PIXMAP_COLORSPACE_sRGB = (1<<2),
+        FBDEV_PIXMAP_EGL_MEMORY = (1<<3)        /* EGL allocates/frees this memory */
+} fbdev_pixmap_flags;
+
+typedef struct fbdev_pixmap
+{
+        unsigned int height;
+        unsigned int width;
+        unsigned int bytes_per_pixel;
+        unsigned char buffer_size;
+        unsigned char red_size;
+        unsigned char green_size;
+        unsigned char blue_size;
+        unsigned char alpha_size;
+        unsigned char luminance_size;
+        fbdev_pixmap_flags flags;
+        unsigned short *data;
+        unsigned int format; /* extra format information in case rgbal is not enough, especially for YUV formats */
+} fbdev_pixmap;
+
 PFNEGLCREATEIMAGEKHRPROC eglCreateImage = nullptr;
 PFNEGLDESTROYIMAGEKHRPROC eglDestroyImage = nullptr;
 // TODO: move tile->linear code to an individual file.
